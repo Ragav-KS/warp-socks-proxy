@@ -79,8 +79,6 @@ for i in $(seq 1 60); do
     if echo "$STATUS" | grep -qi "Connected"; then
         echo "Connected."
 
-        supervisorctl start healthcheck || true
-
         wait "$WARP_PID"
         exit 0
     fi
