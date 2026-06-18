@@ -1,80 +1,94 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-set -e
+set -Eeuo pipefail
 
-# Kill any existing instances of warp-svc before starting a new one
-if pkill -x warp-svc -9; then
-  echo "Existing warp-svc process killed."
-fi
+cleanup() {
+    echo "Stopping warp-svc..."
 
-# Start warp-svc in the background and redirect output to exclude dbus messages
-warp-svc > >(grep -iv dbus) 2> >(grep -iv dbus >&2) &
-WARP_PID=$!
-
-# Trap SIGTERM and SIGINT, and forward those signals to the warp-svc process
-trap "echo 'Stopping warp-svc...'; kill -TERM $WARP_PID; exit" SIGTERM SIGINT
-
-# Maximum number of attempts to try the registration
-MAX_ATTEMPTS=5
-attempt_counter=0
-
-echo "Attempting to start warp-svc and register..."
-
-# Function to check service status and attempt registration
-function attempt_registration {
-  until warp-cli --accept-tos registration new &> /dev/null; do
-    echo "Wait for warp-svc to start... Attempt $((++attempt_counter)) of $MAX_ATTEMPTS"
-    sleep 1
-    if [[ $attempt_counter -ge $MAX_ATTEMPTS ]]; then
-      echo "Failed to register after $MAX_ATTEMPTS attempts. Exiting."
-      return 1
+    if kill -0 "$WARP_PID" 2>/dev/null; then
+        kill -TERM "$WARP_PID"
+        wait "$WARP_PID" || true
     fi
-  done
-  echo "warp-svc has been started and registered successfully!"
+
+    exit 0
 }
 
-# Call the registration function
-if attempt_registration; then
-  echo "Service started and registered successfully."
-else
-  echo "There was an issue starting the service or registering. Check logs for details."
-  kill $WARP_PID
-  exit 1
-fi
+trap cleanup SIGINT SIGTERM
 
-# Set the proxy port to 40000
-warp-cli --accept-tos proxy port 40000
+echo "Starting warp-svc..."
 
-# Set the mode to proxy
-warp-cli --accept-tos mode proxy
+warp-svc \
+    > >(grep -ivE "dbus|debug") \
+    2> >(grep -ivE "dbus|debug" >&2) &
 
-# Disable DNS log
-warp-cli --accept-tos dns log disable
+WARP_PID=$!
 
-# Set the families mode based on the value of the FAMILIES_MODE variable
-warp-cli --accept-tos dns families "${FAMILIES_MODE}"
+echo "Waiting for daemon..."
 
-# Set the WARP_LICENSE if it is not empty
-if [[ -n $WARP_LICENSE ]]; then
-  warp-cli --accept-tos registration license "${WARP_LICENSE}"
-fi
-
-# Connect to the WARP service
-warp-cli --accept-tos connect
-
-while true; do
-  # Check if warp-cli is connected
-  if warp-cli --accept-tos status | grep -iq connected; then
-    echo "Connected successfully."
-    # If connected, start healthcheck and break the loop
-    supervisorctl start healthcheck
-    break
-  else
-    echo "Not connected. Checking again..."
-  fi
-  # Wait for a specified time before checking again
-  sleep 1
+for i in $(seq 1 30); do
+    if warp-cli --accept-tos status >/dev/null 2>&1; then
+        break
+    fi
+    sleep 1
 done
 
-# Wait for warp-svc process to finish
-wait $WARP_PID
+if ! warp-cli --accept-tos status >/dev/null 2>&1; then
+    echo "warp-svc never became ready."
+    exit 1
+fi
+
+echo "warp-svc is ready."
+
+#
+# Register only once
+#
+
+if ! warp-cli --accept-tos registration show >/dev/null 2>&1; then
+    echo "Registering..."
+
+    warp-cli --accept-tos registration new
+
+    if [[ -n "${WARP_LICENSE:-}" ]]; then
+        warp-cli --accept-tos registration license "$WARP_LICENSE"
+    fi
+fi
+
+#
+# Configure
+#
+
+warp-cli --accept-tos mode proxy
+warp-cli --accept-tos proxy port 40000
+warp-cli --accept-tos dns log disable
+warp-cli --accept-tos dns families "${FAMILIES_MODE:-off}"
+
+#
+# Connect
+#
+
+warp-cli --accept-tos connect || true
+
+echo "Waiting for connection..."
+
+for i in $(seq 1 60); do
+
+    STATUS="$(warp-cli --accept-tos status || true)"
+
+    echo "$STATUS"
+
+    if echo "$STATUS" | grep -qi "Connected"; then
+        echo "Connected."
+
+        supervisorctl start healthcheck || true
+
+        wait "$WARP_PID"
+        exit 0
+    fi
+
+    sleep 1
+
+done
+
+echo "Failed to connect."
+
+exit 1
